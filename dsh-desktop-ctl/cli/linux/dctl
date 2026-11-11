@@ -1,0 +1,1016 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""dctl —— 用「无障碍树(UiTree) + 键鼠注入 + 截图」完整操控 Linux 桌面。
+
+设计顺序（重要）：
+  1. 应用界面     → AT-SPI 元素级操作（act/set/read），不占坐标、不抢焦点
+  2. 快捷键/兜底   → ydotool 注入键盘鼠标
+  3. 看结果       → 截图（Ctrl+PrintScreen），只用来「看」，不用来算点击点
+  4. 网页         → 走浏览器调试桥，别用坐标点
+
+运行环境：Ubuntu/GNOME（Wayland 首选，X11 亦可）。依赖 python3-gi + at-spi2-core + ydotool。
+
+常用：
+  dctl doctor                     环境自检
+  dctl apps                       有哪些应用
+  dctl find 确定 --app zenity      找元素 → 得到 ref
+  dctl act 9/0/0/0/1/1            点它
+  dctl set  9/0/0/0/0/1/0/0/0/1 "中文"   直接写输入框（无需焦点）
+  dctl shot                       截图并打印路径/尺寸
+  dctl selftest                   端到端自检（会自动开一个 zenity 窗口）
+"""
+import argparse
+import json
+import warnings
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+VERSION = "2.0.0"
+CFG_DIR = os.path.expanduser("~/.config/dctl")
+CFG_PATH = os.path.join(CFG_DIR, "config.json")
+
+# ---------------------------------------------------------------- 环境准备
+
+def _env_defaults():
+    rt = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+    os.environ.setdefault("XDG_RUNTIME_DIR", rt)
+    bus = os.path.join(rt, "bus")
+    if os.path.exists(bus):
+        os.environ.setdefault("DBUS_SESSION_BUS_ADDRESS", "unix:path=" + bus)
+    sock = "/tmp/.ydotool_socket"
+    if os.path.exists(sock):
+        os.environ.setdefault("YDOTOOL_SOCKET", sock)
+
+_env_defaults()
+
+def load_cfg():
+    try:
+        with open(CFG_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_cfg(cfg):
+    os.makedirs(CFG_DIR, exist_ok=True)
+    with open(CFG_PATH, "w") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+def die(msg, code=1):
+    print("错误: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+# ---------------------------------------------------------------- AT-SPI
+
+def _atspi():
+    warnings.filterwarnings("ignore", category=DeprecationWarning)
+    try:
+        import gi
+        gi.require_version("Atspi", "2.0")
+        from gi.repository import Atspi
+        return Atspi
+    except Exception as e:
+        die("拿不到 AT-SPI（%s）。请用 /usr/bin/python3 运行，并确认装了 python3-gi、gir1.2-atspi-2.0、at-spi2-core" % e)
+
+def desktop():
+    return _atspi().get_desktop(0)
+
+def resolve(ref):
+    node = desktop()
+    for part in [p for p in str(ref).split("/") if p]:
+        try:
+            idx = int(part)
+        except ValueError:
+            die("ref 必须是数字链，例如 9/0/0/1：%r" % ref)
+        node = node.get_child_at_index(idx)
+        if node is None:
+            die("ref 在 %r 处断开（界面结构变了？重新 find）" % part)
+    return node
+
+def ref_of(node):
+    parts, cur, root = [], node, desktop()
+    while cur is not None and cur is not root:
+        try:
+            parent = cur.get_parent()
+        except Exception:
+            break
+        if parent is None:
+            break
+        idx = None
+        for j in range(parent.get_child_count()):
+            if parent.get_child_at_index(j) == cur:
+                idx = j
+                break
+        if idx is None:
+            break
+        parts.append(str(idx))
+        cur = parent
+    return "/".join(reversed(parts))
+
+def actions_of(node):
+    try:
+        ai = node.get_action_iface()
+        if not ai:
+            return []
+        return [ai.get_action_name(k) for k in range(ai.get_n_actions())]
+    except Exception:
+        return []
+
+def text_of(node):
+    try:
+        ti = node.get_text_iface()
+        if ti:
+            n = ti.get_character_count()
+            return ti.get_text(0, n) or ""
+    except Exception:
+        pass
+    try:
+        vi = node.get_value_iface()
+        if vi:
+            return str(vi.get_current_value())
+    except Exception:
+        pass
+    return ""
+
+def describe(node):
+    try:
+        role = node.get_role_name()
+    except Exception:
+        role = "?"
+    name = node.get_name() or ""
+    desc = node.get_description() or ""
+    out = ["[%s]" % role]
+    if name:
+        out.append("name=%r" % name)
+    if desc and desc != name:
+        out.append("desc=%r" % desc)
+    txt = text_of(node)
+    if txt:
+        out.append("text=%r" % txt)
+    acts = actions_of(node)
+    if acts:
+        out.append("actions=%s" % acts)
+    return " ".join(out)
+
+def app_windows(app):
+    """应用下的窗口节点（frame/dialog/window）。"""
+    out = []
+    try:
+        n = app.get_child_count()
+    except Exception:
+        return out
+    for j in range(min(n, 12)):
+        try:
+            w = app.get_child_at_index(j)
+            out.append(w)
+        except Exception:
+            pass
+    return out
+
+def app_titles(app):
+    titles = []
+    for w in app_windows(app):
+        try:
+            t = w.get_name() or ""
+        except Exception:
+            t = ""
+        if t:
+            titles.append(t)
+    return titles
+
+def find_all_apps(name):
+    """返回所有匹配 name 的 (索引, 应用) 列表：先精确名，再模糊名，最后窗口标题。"""
+    d = desktop()
+    exact, fuzzy = [], []
+    for i in range(d.get_child_count()):
+        try:
+            a = d.get_child_at_index(i)
+            an = a.get_name() or ""
+        except Exception:
+            continue
+        if an == name:
+            exact.append((i, a))
+        elif name.lower() in an.lower():
+            fuzzy.append((i, a))
+    if exact or fuzzy:
+        return exact + fuzzy
+    hits = []
+    for i in range(d.get_child_count()):
+        try:
+            a = d.get_child_at_index(i)
+        except Exception:
+            continue
+        if any(name.lower() in t.lower() for t in app_titles(a)):
+            hits.append((i, a))
+    return hits
+
+def find_app(name, title=None):
+    """按应用名或窗口标题找顶层应用（'计算器' 和 'gnome-calculator' 都能命中）。
+    title 给了就只在窗口标题包含该串的应用里挑——同名多实例时用它区分。"""
+    cands = find_all_apps(name)
+    if title:
+        narrowed = [c for c in cands if any(title.lower() in t.lower() for t in app_titles(c[1]))]
+        if narrowed:
+            cands = narrowed
+        else:
+            # 应用名没命中但有别家窗口标题命中
+            extra = []
+            d = desktop()
+            for i in range(d.get_child_count()):
+                try:
+                    a = d.get_child_at_index(i)
+                except Exception:
+                    continue
+                if any(title.lower() in t.lower() for t in app_titles(a)):
+                    extra.append((i, a))
+            if extra:
+                cands = extra
+    return cands[0] if cands else None
+
+# ---------------------------------------------------------------- ydotool
+
+KEYCODES = {
+    "esc": 1, "escape": 1, "tab": 15, "enter": 28, "return": 28, "space": 57,
+    "backspace": 14, "delete": 111, "del": 111, "insert": 110,
+    "home": 102, "end": 107, "pageup": 104, "pagedown": 109,
+    "up": 103, "down": 108, "left": 105, "right": 106,
+    "ctrl": 29, "control": 29, "alt": 56, "shift": 42, "super": 125, "meta": 125, "win": 125,
+    "print": 99, "printscreen": 99, "capslock": 58, "menu": 139,
+    "minus": 12, "equal": 13, "comma": 51, "dot": 52, "period": 52, "slash": 53,
+    "semicolon": 39, "apostrophe": 40, "grave": 41, "leftbrace": 26, "rightbrace": 27,
+    "backslash": 43,
+}
+for _c in "1234567890":
+    KEYCODES[_c] = 2 + (int(_c) - 1) % 10
+for _i, _c in enumerate("qwertyuiopasdfghjklzxcvbnm"):
+    KEYCODES.setdefault(_c, [16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+                             30, 31, 32, 33, 34, 35, 36, 37, 38,
+                             44, 45, 46, 47, 48, 49, 50][_i])
+for _i in range(1, 13):
+    KEYCODES["f%d" % _i] = [59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 87, 88][_i - 1]
+SHIFTED = {"!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6", "&": "7",
+           "*": "8", "(": "9", ")": "0", "_": "minus", "+": "equal", "{": "leftbrace",
+           "}": "rightbrace", "|": "backslash", ":": "semicolon", '"': "apostrophe",
+           "<": "comma", ">": "dot", "?": "slash", "~": "grave"}
+
+def yd(*args, check=True):
+    exe = shutil.which("ydotool") or "/usr/bin/ydotool"
+    try:
+        p = subprocess.run([exe] + [str(a) for a in args], capture_output=True, text=True, timeout=20)
+    except FileNotFoundError:
+        die("没装 ydotool：sudo apt install ydotool")
+    if check and p.returncode != 0:
+        die("ydotool %s 失败: %s" % (" ".join(map(str, args)), (p.stderr or p.stdout).strip()))
+    return p
+
+def parse_combo(combo):
+    """'ctrl+alt+t' / 'super' / 'F4' → [keycode, ...]"""
+    codes = []
+    for tok in combo.replace("-", "+").split("+"):
+        tok = tok.strip()
+        if not tok:
+            continue
+        low = tok.lower()
+        if low in KEYCODES:
+            codes.append(KEYCODES[low])
+        elif tok in SHIFTED:
+            codes.append(KEYCODES[SHIFTED[tok]])
+            codes.insert(0, KEYCODES["shift"])
+        elif len(tok) == 1 and tok.isalpha():
+            codes.append(KEYCODES[tok.lower()])
+            if tok.isupper():
+                codes.insert(0, KEYCODES["shift"])
+        elif low.isdigit():
+            codes.append(KEYCODES[low])
+        else:
+            die("不认识的键：%r（可用：%s）" % (tok, ", ".join(sorted(KEYCODES)[:20]) + " ..."))
+    return codes
+
+def press_keys(codes, hold=0.03):
+    seq = ["%d:1" % c for c in codes] + ["%d:0" % c for c in reversed(codes)]
+    yd("key", *seq)
+    time.sleep(hold)
+
+# ---------------------------------------------------------------- 截图
+
+def pictures_dir():
+    try:
+        p = subprocess.run(["xdg-user-dir", "PICTURES"], capture_output=True, text=True, timeout=5)
+        base = (p.stdout or "").strip() or os.path.expanduser("~/Pictures")
+    except Exception:
+        base = os.path.expanduser("~/Pictures")
+    if not os.path.isdir(base):
+        base = os.path.expanduser("~/图片") if os.path.isdir(os.path.expanduser("~/图片")) else base
+    return os.path.join(base, "Screenshots") if os.path.isdir(os.path.join(base, "Screenshots")) \
+        else os.path.join(base, "截图") if os.path.isdir(os.path.join(base, "截图")) \
+        else os.path.join(base, "Screenshots")
+
+def _png_size(path):
+    try:
+        with open(path, "rb") as f:
+            head = f.read(24)
+        if head[:8] == b"\x89PNG\r\n\x1a\n":
+            import struct
+            w, h = struct.unpack(">II", head[16:24])
+            return w, h
+    except Exception:
+        pass
+    return 0, 0
+
+def shot(out=None, settle=1.3, timeout=10.0):
+    """截图。GNOME 走 PrintScreen 界面 + Space 确认；其它环境尝试 grim/spectacle/gnome-screenshot。"""
+    session = os.environ.get("XDG_SESSION_TYPE", "")
+    if shutil.which("grim") and session == "wayland" and not os.environ.get("GNOME_SETUP_DISPLAY"):
+        pass
+    if shutil.which("grim") and "gnome" not in (os.environ.get("XDG_CURRENT_DESKTOP", "").lower()):
+        out = out or os.path.join(os.path.expanduser("~"), "shot-%s.png" % time.strftime("%Y%m%d-%H%M%S"))
+        p = subprocess.run(["grim", out], capture_output=True, text=True)
+        if p.returncode == 0 and os.path.exists(out):
+            w, h = _png_size(out)
+            return out, w, h
+    if shutil.which("spectacle"):
+        out = out or os.path.join(os.path.expanduser("~"), "shot-%s.png" % time.strftime("%Y%m%d-%H%M%S"))
+        subprocess.run(["spectacle", "-b", "-n", "-f", "-o", out], capture_output=True)
+        if os.path.exists(out):
+            w, h = _png_size(out)
+            return out, w, h
+
+    d = pictures_dir()
+    os.makedirs(d, exist_ok=True)
+    if session == "x11" and shutil.which("gnome-screenshot"):
+        out = out or os.path.join(d, "截图 %s.png" % time.strftime("%Y-%m-%d %H-%M-%S"))
+        subprocess.run(["gnome-screenshot", "-f", out], capture_output=True)
+        if os.path.exists(out):
+            w, h = _png_size(out)
+            return out, w, h
+
+    # GNOME/Wayland 唯一可靠的路径：PrintScreen 打开截图界面 → Space 确认整屏
+    # 注意：界面弹出要 1.5~2.5s，Space 发早了会被忽略；所以「等 → 按 → 再补按」。
+    settle = float(os.environ.get("DCTL_SHOT_SETTLE", settle or 2.0))
+    deadline = time.time() + timeout
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        before = set(os.listdir(d))
+        press_keys([KEYCODES["print"]], hold=0.0)
+        time.sleep(settle + (0.6 if attempt > 1 else 0.0))
+        for _ in range(3):  # 最多补按 3 次 Space
+            press_keys([KEYCODES["space"]], hold=0.0)
+            sub = time.time() + 2.5
+            while time.time() < sub:
+                new = [f for f in os.listdir(d) if f not in before and f.lower().endswith(".png")]
+                if new:
+                    newest = max(new, key=lambda f: os.path.getmtime(os.path.join(d, f)))
+                    path = os.path.join(d, newest)
+                    for _w in range(20):  # 等文件写完
+                        w, h = _png_size(path)
+                        if w:
+                            return path, w, h
+                        time.sleep(0.1)
+                time.sleep(0.2)
+        # 这一轮没成：关掉可能残留的截图界面，重来
+        press_keys([KEYCODES["esc"]], hold=0.0)
+        time.sleep(0.8)
+    raise RuntimeError("等不到截图文件（目录 %s）。确认 ydotoold 在跑、截图快捷键没被改；可先手动按 PrintScreen 试一次" % d)
+
+# ---------------------------------------------------------------- 几何
+
+def x11_size():
+    try:
+        p = subprocess.run(["xrandr", "--current"], capture_output=True, text=True, timeout=5)
+        m = re.search(r"current\s+(\d+)\s*x\s*(\d+)", p.stdout or "")
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    except Exception:
+        pass
+    return 0, 0
+
+def logical_monitors():
+    """返回 [(x, y, scale, 物理宽, 物理高), ...]；拿不到就空列表。"""
+    try:
+        import gi
+        gi.require_version("Gio", "2.0")
+        from gi.repository import Gio
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        res = bus.call_sync("org.gnome.Mutter.DisplayConfig", "/org/gnome/Mutter/DisplayConfig",
+                            "org.gnome.Mutter.DisplayConfig", "GetCurrentState", None, None,
+                            Gio.DBusCallFlags.NONE, 5000, None)
+        _serial, monitors, logical, _props = res.unpack()
+        table = {}
+        for mon in monitors:
+            conn = mon[0][0]
+            for mode in mon[1]:
+                if mode[6].get("is-current"):
+                    table[conn] = (mode[1], mode[2])
+        out = []
+        for lm in logical:
+            x, y, scale, _tr, _primary, mons, _props = lm
+            w = h = 0
+            for key in mons:
+                if key[0] in table:
+                    w, h = table[key[0]]
+            # 逻辑分辨率 = 当前模式 / 缩放
+            lw = int(round(w / scale)) if scale else w
+            lh = int(round(h / scale)) if scale else h
+            out.append((x, y, round(scale, 4), w, h, lw, lh))
+        return out
+    except Exception:
+        return []
+
+def geom_report():
+    Atspi = _atspi()
+    d = desktop()
+    ext = d.get_extents(Atspi.CoordType.SCREEN)
+    xw, xh = x11_size()
+    lms = logical_monitors()
+    info = {
+        "session": os.environ.get("XDG_SESSION_TYPE", "?"),
+        "desktop": os.environ.get("XDG_CURRENT_DESKTOP", "?"),
+        "atspi_desktop": [ext.x, ext.y, ext.width, ext.height],
+        "x11_screen": [xw, xh],
+        "logical_monitors": [{"x": a, "y": b, "scale": s, "mode": [w, h], "logical": [lw, lh]}
+                             for a, b, s, w, h, lw, lh in lms],
+    }
+    try:
+        path, w, h = shot()
+        info["last_shot"] = {"path": path, "size": [w, h]}
+    except Exception as e:
+        info["last_shot_error"] = str(e)
+    return info
+
+# ---------------------------------------------------------------- 剪贴板
+
+def clip_set(text):
+    data = text.encode()
+    if shutil.which("wl-copy"):
+        try:
+            p = subprocess.run(["wl-copy"], input=data, timeout=3)
+            if p.returncode == 0:
+                return "wl-copy"
+        except subprocess.TimeoutExpired:
+            pass
+    if shutil.which("xclip"):
+        subprocess.run(["xclip", "-selection", "clipboard"], input=data, timeout=5)
+        return "xclip"
+    die("没有剪贴板工具：sudo apt install wl-clipboard xclip")
+
+def clip_get():
+    for cmd in (["wl-paste", "-n"], ["xclip", "-selection", "clipboard", "-o"]):
+        if shutil.which(cmd[0]):
+            try:
+                p = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
+                if p.returncode == 0:
+                    return p.stdout
+            except subprocess.TimeoutExpired:
+                continue
+    return ""
+
+# ---------------------------------------------------------------- 子命令
+
+def cmd_apps(a):
+    d = desktop()
+    for i in range(d.get_child_count()):
+        app = d.get_child_at_index(i)
+        print("%d\t%s\tchildren=%d" % (i, app.get_name(), app.get_child_count()))
+
+def cmd_windows(a):
+    d = desktop()
+    for i in range(d.get_child_count()):
+        app = d.get_child_at_index(i)
+        n = min(app.get_child_count(), 8)
+        for j in range(n):
+            w = app.get_child_at_index(j)
+            if w is None:
+                continue
+            try:
+                role = w.get_role_name()
+            except Exception:
+                continue
+            if role in ("frame", "dialog", "window"):
+                print("%d/%d\t%s\t%s" % (i, j, app.get_name(), w.get_name()))
+
+def cmd_tree(a):
+    app = find_app(a.app, getattr(a, "title", None))
+    if not app:
+        die("没找到应用 %r（先跑 dctl apps）" % a.app)
+    idx, node = app
+    roles = set(x.strip() for x in a.roles.split(",")) if a.roles else None
+
+    def walk(n, base, depth):
+        try:
+            role = n.get_role_name()
+        except Exception:
+            return
+        if roles is None or role in roles:
+            print("  " * depth + "%s  %s" % (base, describe(n)))
+        if depth >= a.depth:
+            return
+        try:
+            cnt = n.get_child_count()
+        except Exception:
+            return
+        for j in range(cnt):
+            c = n.get_child_at_index(j)
+            if c is not None:
+                walk(c, "%s/%d" % (base, j), depth + 1)
+
+    walk(node, str(idx), 0)
+
+def cmd_find(a):
+    needle = a.text.lower()
+    hits = []
+    roots = []
+    if a.app:
+        app = find_app(a.app, getattr(a, "title", None))
+        if not app:
+            die("没找到应用 %r" % a.app)
+        roots = [app]
+    else:
+        d = desktop()
+        roots = [(i, d.get_child_at_index(i)) for i in range(d.get_child_count())]
+    budget = [200000]
+
+    def scan(n, base, depth):
+        if depth > a.depth or len(hits) >= a.limit or budget[0] <= 0:
+            return
+        budget[0] -= 1
+        try:
+            role = n.get_role_name()
+            name = (n.get_name() or "") + " " + (n.get_description() or "")
+        except Exception:
+            return
+        ok_role = a.role is None or role == a.role
+        ok_text = (needle in name.lower()) if not a.exact else (n.get_name() == a.text)
+        if ok_role and ok_text:
+            hits.append((base, describe(n)))
+        try:
+            cnt = n.get_child_count()
+        except Exception:
+            return
+        for j in range(cnt):
+            c = n.get_child_at_index(j)
+            if c is not None:
+                scan(c, "%s/%d" % (base, j), depth + 1)
+
+    for i, r in roots:
+        scan(r, str(i), 0)
+    if not hits:
+        print("没找到（可加 --depth 24 或换关键字；按钮文字常带快捷键如 '确定(O)'）")
+        return
+    for ref, line in hits:
+        print("%s  %s" % (ref, line))
+
+def cmd_info(a):
+    print(describe(resolve(a.ref)))
+
+def cmd_act(a):
+    node = resolve(a.ref)
+    acts = actions_of(node)
+    if not acts:
+        die("这个元素没有可执行动作：%s" % describe(node))
+    want = a.action
+    if want is None:
+        want = "click" if "click" in acts else acts[0]
+    if want not in acts:
+        die("没有动作 %r，可选：%s" % (want, acts))
+    ok = node.get_action_iface().do_action(acts.index(want))
+    print("%s %s on %s" % ("OK" if ok else "FAIL", want, describe(node)))
+    return 0 if ok else 1
+
+def cmd_read(a):
+    node = resolve(a.ref)
+    txt = text_of(node)
+    print(txt if txt else describe(node))
+
+def cmd_set(a):
+    node = resolve(a.ref)
+    ei = node.get_editable_text_iface()
+    if ei:
+        ei.set_text_contents(a.value)
+        print("OK 已写入 %s" % describe(node))
+        return 0
+    acts = actions_of(node)
+    if "activate" in acts:
+        node.get_action_iface().do_action(acts.index("activate"))
+        time.sleep(0.2)
+        ei = node.get_editable_text_iface()
+        if ei:
+            ei.set_text_contents(a.value)
+            print("OK 已写入（先 activate）%s" % describe(node))
+            return 0
+    die("这个节点不可编辑：%s\n提示：多数输入框是 [text]/[entry]；先 dctl tree APP 看结构" % describe(node))
+
+def cmd_focus(a):
+    node = resolve(a.ref)
+    try:
+        c = node.get_component_iface()
+        ok = c.grab_focus()
+        print("%s grab_focus %s" % ("OK" if ok else "FAIL", describe(node)))
+        return 0 if ok else 1
+    except Exception as e:
+        die("grab_focus 失败（%s）。可用 Alt+Tab / 点窗口标题栏；元素级操作本身不需要焦点" % e)
+
+def cmd_wait(a):
+    deadline = time.time() + a.timeout
+    while time.time() < deadline:
+        if a.app:
+            app = find_app(a.app, getattr(a, "title", None))
+            if app:
+                print("OK 应用已出现：%s" % app[1].get_name())
+                return 0
+        if a.text:
+            hits = []
+            d = desktop()
+            for i in range(d.get_child_count()):
+                pass
+            # 轻量：全树找文字
+            stack = [(str(i), d.get_child_at_index(i)) for i in range(d.get_child_count())]
+            while stack and len(hits) < 1:
+                base, n = stack.pop()
+                try:
+                    nm = (n.get_name() or "") + " " + (n.get_description() or "")
+                except Exception:
+                    nm = ""
+                if a.text.lower() in nm.lower():
+                    hits.append((base, describe(n)))
+                    break
+                try:
+                    cnt = n.get_child_count()
+                except Exception:
+                    cnt = 0
+                for j in range(cnt):
+                    c = n.get_child_at_index(j)
+                    if c is not None:
+                        stack.append(("%s/%d" % (base, j), c))
+            if hits:
+                print("OK 文字已出现：%s" % hits[0][1])
+                return 0
+        time.sleep(0.5)
+    die("等待超时（%.1fs）：%s" % (a.timeout, a.app or a.text))
+
+def cmd_key(a):
+    codes = []
+    for combo in a.combos:
+        codes.extend(parse_combo(combo))
+    for _ in range(a.times):
+        press_keys(codes, hold=a.hold)
+    print("OK key " + " ".join(a.combos) + (" x%d" % a.times if a.times > 1 else ""))
+
+def cmd_type(a):
+    if any(ord(ch) > 126 for ch in a.text):
+        die("ydotool 打字只可靠支持 ASCII。中文/表情请用：dctl set REF 文本（写输入框），或 dctl paste 文本（剪贴板+Ctrl+V）")
+    yd("type", "--delay", str(a.delay), a.text)
+    print("OK type %r" % a.text)
+
+def cmd_paste(a):
+    how = clip_set(a.text)
+    time.sleep(0.25)
+    combo = "ctrl+shift+v" if a.terminal else "ctrl+v"
+    press_keys(parse_combo(combo))
+    print("OK paste（剪贴板经 %s，发送 %s）" % (how, combo))
+
+def cmd_clip(a):
+    if a.action == "get":
+        sys.stdout.write(clip_get())
+    else:
+        print("OK 写入剪贴板（%s）" % clip_set(a.text))
+
+def cmd_click(a):
+    x, y = a.x, a.y
+    if a.ref:
+        Atspi = _atspi()
+        node = resolve(a.ref)
+        print("提示: GNOME/Wayland 下 AT-SPI 常不报告窗口位置（frame extents 恒为 0,0），")
+        print("      --ref 只在能报准确位置的桌面有效；不可靠时请用截图量坐标再换算。")
+        e = node.get_extents(Atspi.CoordType.SCREEN)
+        cfg = load_cfg()
+        scale = a.scale if a.scale else cfg.get("pointer_scale", 1.0)
+        x = int((e.x + e.width / 2.0) * scale)
+        y = int((e.y + e.height / 2.0) * scale)
+        print("ref 中心 → 指针坐标 (%d,%d)（atspi %s 缩放 %s）" % (x, y, (e.x + e.width // 2, e.y + e.height // 2), scale))
+    yd("mousemove", "--absolute", int(x), int(y))
+    time.sleep(0.08)
+    yd("click", "1")
+    print("OK click (%d,%d)" % (x, y))
+
+def cmd_move(a):
+    yd("mousemove", "--absolute", int(a.x), int(a.y))
+    print("OK move (%d,%d)" % (a.x, a.y))
+
+def cmd_launch(a):
+    cmd = a.cmd
+    if len(cmd) == 1 and cmd[0].endswith(".desktop"):
+        subprocess.Popen(["gtk-launch", cmd[0]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    elif len(cmd) == 1 and shutil.which("gtk-launch") and os.path.exists("/usr/share/applications/" + cmd[0]):
+        subprocess.Popen(["gtk-launch", cmd[0]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    print("OK launch %s" % " ".join(cmd))
+    if a.wait:
+        deadline = time.time() + a.wait
+        while time.time() < deadline:
+            if a.app and find_app(a.app):
+                print("OK 应用已出现：%s" % a.app)
+                return 0
+            time.sleep(0.4)
+        print("提示：%.1fs 内没在无障碍树里看到应用，可能还在启动" % a.wait)
+
+def cmd_shot(a):
+    path, w, h = shot(out=a.out)
+    size = os.path.getsize(path)
+    if a.json:
+        print(json.dumps({"path": path, "width": w, "height": h, "bytes": size}, ensure_ascii=False))
+    else:
+        print(path)
+        print("%dx%d  %d bytes" % (w, h, size))
+
+def cmd_geom(a):
+    info = geom_report()
+    if a.json:
+        print(json.dumps(info, ensure_ascii=False, indent=2))
+        return
+    print("会话: %s / %s" % (info["session"], info["desktop"]))
+    print("AT-SPI 桌面: %dx%d @ (%d,%d)" % (info["atspi_desktop"][2], info["atspi_desktop"][3],
+                                            info["atspi_desktop"][0], info["atspi_desktop"][1]))
+    if info["x11_screen"][0]:
+        print("X11 屏幕: %dx%d" % tuple(info["x11_screen"]))
+    for lm in info["logical_monitors"]:
+        print("显示器: 模式 %dx%d @ (%d,%d) 缩放 %s → 逻辑分辨率 %dx%d" % (
+            lm["mode"][0], lm["mode"][1], lm["x"], lm["y"], lm["scale"], lm["logical"][0], lm["logical"][1]))
+    if "last_shot" in info:
+        s = info["last_shot"]
+        print("最近截图: %s  %dx%d" % (s["path"], s["size"][0], s["size"][1]))
+        if info["x11_screen"][0] and s["size"][0]:
+            print("截图→X11 比例: %.3f" % (info["x11_screen"][0] / float(s["size"][0])))
+        lw = sum(lm["logical"][0] for lm in info["logical_monitors"]) or 0
+        if lw and s["size"][0]:
+            print("截图→逻辑分辨率 比例: %.3f" % (lw / float(s["size"][0])))
+            print("提示: 指针坐标空间一般是逻辑分辨率 %dx%d；元素坐标(AT-SPI)若与之不符，用 --scale 换算" % (
+                lw, sum(lm["logical"][1] for lm in info["logical_monitors"])))
+    else:
+        print("最近截图: 失败（%s）" % info.get("last_shot_error"))
+    print("\n说明：这三套坐标系常常不一致（高分屏缩放/HDR 会让截图被缩小）。")
+    print("元素级操作用 ref，不用坐标；只有画布类界面才需要坐标，那时候先做一次点击校准。")
+
+def cmd_doctor(a):
+    ok = True
+    def check(label, fn, fix):
+        nonlocal ok
+        try:
+            good, detail = fn()
+        except Exception as e:
+            good, detail = False, str(e)
+        print(("  [ OK ] " if good else "  [FAIL] ") + label + (("  " + detail) if detail else ""))
+        if not good:
+            ok = False
+            if fix:
+                print("         修复: " + fix)
+        return good
+
+    print("dctl %s 环境自检" % VERSION)
+    sess = os.environ.get("XDG_SESSION_TYPE", "?")
+    print("  会话类型: %s   桌面: %s" % (sess, os.environ.get("XDG_CURRENT_DESKTOP", "?")))
+    check("python3-gi + Atspi", lambda: (_atspi() and True, ""),
+          "sudo apt install python3-gi gir1.2-atspi-2.0 at-spi2-core（并用 /usr/bin/python3 运行）")
+    check("无障碍树可读", lambda: (desktop().get_child_count() > 0,
+                               "顶层应用 %d 个" % desktop().get_child_count()),
+          "gsettings set org.gnome.desktop.interface toolkit-accessibility true")
+    check("toolkit-accessibility", lambda: (_gsettings_bool(), ""),
+          "gsettings set org.gnome.desktop.interface toolkit-accessibility true")
+    check("ydotool 可执行", lambda: (bool(shutil.which("ydotool")), shutil.which("ydotool") or ""),
+          "sudo apt install ydotool")
+    check("ydotoold 套接字", lambda: (os.path.exists(os.environ.get("YDOTOOL_SOCKET", "/tmp/.ydotool_socket")),
+                                    os.environ.get("YDOTOOL_SOCKET", "/tmp/.ydotool_socket")),
+          "见 TUTORIAL「装 ydotoold 服务」一节")
+    check("键鼠注入实测", lambda: _test_inject(), "确认 ydotoold 在跑且套接字 0666")
+    check("截图目录", lambda: (os.path.isdir(pictures_dir()), pictures_dir()),
+          "mkdir -p ~/Pictures/Screenshots")
+    check("剪贴板", lambda: (bool(shutil.which("wl-copy") or shutil.which("xclip")), ""),
+          "sudo apt install wl-clipboard xclip")
+    print("结论: " + ("全部通过，可以开始" if ok else "有失败项，先按上面修复"))
+    return 0 if ok else 1
+
+def _gsettings_bool():
+    try:
+        p = subprocess.run(["gsettings", "get", "org.gnome.desktop.interface", "toolkit-accessibility"],
+                           capture_output=True, text=True, timeout=5)
+        return (p.stdout or "").strip() == "true"
+    except Exception:
+        return False
+
+def _test_inject():
+    # 移动指针到原点附近再回来，验证 socket 通路（不动键盘，避免误触）
+    yd("mousemove", "--absolute", 10, 10)
+    yd("mousemove", "--absolute", 12, 12)
+    return True, "指针可移动"
+
+def cmd_selftest(a):
+    """端到端：开 zenity → 找输入框 → 写中文 → 点确定 → 校验返回值 → 截图。"""
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(prefix="dctl-selftest-", suffix=".txt", delete=False).name
+    tag = "dctl-selftest-%d" % os.getpid()
+    print("1) 启动 zenity 输入框")
+    # 清掉上次崩溃留下的窗口：否则会写进别人的输入框，点确定返回空
+    subprocess.run(["pkill", "-f", "zenity --entry --title dctl-selftest"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    time.sleep(0.4)
+    proc = subprocess.Popen(["zenity", "--entry", "--title", tag, "--text", "输入内容"],
+                            stdout=open(tmp, "w"), stderr=subprocess.DEVNULL, start_new_session=True)
+    deadline = time.time() + 12
+    entry = None
+    target_app = None
+    while time.time() < deadline:
+        d = desktop()
+        for i in range(d.get_child_count()):
+            app = d.get_child_at_index(i)
+            if (app.get_name() or "").lower() != "zenity":
+                continue
+            if not any(tag in t for t in app_titles(app)):
+                continue     # 不是本次开的那个窗口
+            target_app = (i, app)
+            stack = [(str(i), app)]
+            while stack:
+                base, n = stack.pop()
+                try:
+                    role = n.get_role_name()
+                except Exception:
+                    continue
+                if role == "text":
+                    entry = (base, n)
+                    break
+                for j in range(n.get_child_count()):
+                    c = n.get_child_at_index(j)
+                    if c is not None:
+                        stack.append(("%s/%d" % (base, j), c))
+            if entry:
+                break
+        if entry:
+            break
+        time.sleep(0.4)
+    if not entry:
+        proc.kill()
+        die("没等到 zenity 的输入框；请手工跑一次 zenity --entry 看是否能出现在 dctl apps 里")
+    ref, node = entry
+    print("2) 找到输入框 %s" % ref)
+    payload = "沈叙 selftest ✓ 中文"
+    ei = node.get_editable_text_iface()
+    if not ei:
+        die("输入框没有 editable-text 接口，这台机器的 GTK 无障碍可能没开")
+    ei.set_text_contents(payload)
+    print("3) 已写入文本（无需键盘焦点）")
+    ok_btn = None
+    d = desktop()
+    app = target_app or find_app("zenity", tag)
+    if not app:
+        proc.kill()
+        die("zenity 窗口消失了，重跑一次 dctl selftest")
+    stack = [(str(app[0]), app[1])]
+    while stack:
+        base, n = stack.pop()
+        try:
+            role = n.get_role_name()
+            name = n.get_name() or ""
+        except Exception:
+            continue
+        if role == "button" and ("确定" in name or "OK" in name.upper()):
+            ok_btn = (base, n)
+            break
+        for j in range(n.get_child_count()):
+            c = n.get_child_at_index(j)
+            if c is not None:
+                stack.append(("%s/%d" % (base, j), c))
+    if not ok_btn:
+        proc.kill()
+        die("没找到「确定」按钮")
+    acts = actions_of(ok_btn[1])
+    ok_btn[1].get_action_iface().do_action(acts.index("click") if "click" in acts else 0)
+    print("4) 已点击确定")
+    time.sleep(0.8)
+    try:
+        with open(tmp) as f:
+            got = f.read().strip()
+    except Exception:
+        got = ""
+    proc.poll()
+    if proc.returncode is None:
+        proc.kill()   # 对话框还开着，说明点错了窗口
+    if got != payload:
+        die("返回值不对：%r（期望 %r）。无障碍读/写可能被环境限制" % (got, payload))
+    print("5) 回读正确：%r" % got)
+    path, w, h = shot()
+    print("6) 截图 OK：%s  %dx%d" % (path, w, h))
+    print("\n自检通过：元素级操作 + 键鼠 + 截图 全链路可用。")
+
+def main():
+    p = argparse.ArgumentParser(prog="dctl", description="无障碍树 + 键鼠注入 + 截图 的桌面操控 CLI",
+                                formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    p.add_argument("--version", action="version", version="dctl " + VERSION)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("apps", help="列出顶层应用").set_defaults(func=cmd_apps)
+    sub.add_parser("windows", help="列出窗口").set_defaults(func=cmd_windows)
+    sub.add_parser("doctor", help="环境自检").set_defaults(func=cmd_doctor)
+    g = sub.add_parser("geom", help="打印各坐标系与比例")
+    g.add_argument("--json", action="store_true")
+    g.set_defaults(func=cmd_geom)
+    sub.add_parser("selftest", help="端到端自检").set_defaults(func=cmd_selftest)
+
+    t = sub.add_parser("tree", help="打印应用的无障碍树")
+    t.add_argument("app")
+    t.add_argument("--depth", type=int, default=6)
+    t.add_argument("--roles", default=None, help="只显示这些 role，逗号分隔")
+    t.add_argument("--title", default=None, help="同名应用多开时，按窗口标题再筛一层")
+    t.set_defaults(func=cmd_tree)
+
+    f = sub.add_parser("find", help="按文字找元素")
+    f.add_argument("text")
+    f.add_argument("--role", default=None)
+    f.add_argument("--app", default=None)
+    f.add_argument("--limit", type=int, default=10)
+    f.add_argument("--depth", type=int, default=24)
+    f.add_argument("--exact", action="store_true")
+    f.add_argument("--title", default=None, help="同名应用多开时，按窗口标题再筛一层")
+    f.set_defaults(func=cmd_find)
+
+    for name, fn, hlp in (("info", cmd_info, "看元素详情"), ("read", cmd_read, "读元素文本")):
+        x = sub.add_parser(name, help=hlp)
+        x.add_argument("ref")
+        x.set_defaults(func=fn)
+
+    ac = sub.add_parser("act", help="对元素执行动作（默认点击）")
+    ac.add_argument("ref")
+    ac.add_argument("--action", default=None)
+    ac.set_defaults(func=cmd_act)
+
+    st = sub.add_parser("set", help="给可编辑元素赋值（支持中文，不需要焦点）")
+    st.add_argument("ref")
+    st.add_argument("value")
+    st.set_defaults(func=cmd_set)
+
+    fo = sub.add_parser("focus", help="尝试聚焦元素")
+    fo.add_argument("ref")
+    fo.set_defaults(func=cmd_focus)
+
+    w = sub.add_parser("wait", help="等应用/文字出现")
+    w.add_argument("--app", default=None)
+    w.add_argument("--text", default=None)
+    w.add_argument("--timeout", type=float, default=15)
+    w.add_argument("--title", default=None, help="同名应用多开时，按窗口标题再筛一层")
+    w.set_defaults(func=cmd_wait)
+
+    k = sub.add_parser("key", help="发组合键，如 ctrl+alt+t / super / F4 / ctrl+shift+v")
+    k.add_argument("combos", nargs="+")
+    k.add_argument("--times", type=int, default=1)
+    k.add_argument("--hold", type=float, default=0.03)
+    k.set_defaults(func=cmd_key)
+
+    ty = sub.add_parser("type", help="键盘打字（仅 ASCII）")
+    ty.add_argument("text")
+    ty.add_argument("--delay", type=int, default=12)
+    ty.set_defaults(func=cmd_type)
+
+    pa = sub.add_parser("paste", help="剪贴板写入后 Ctrl+V")
+    pa.add_argument("text")
+    pa.add_argument("--terminal", action="store_true", help="终端里用 Ctrl+Shift+V")
+    pa.set_defaults(func=cmd_paste)
+
+    cl = sub.add_parser("clip", help="读写剪贴板")
+    cl.add_argument("action", choices=["get", "set"])
+    cl.add_argument("text", nargs="?", default="")
+    cl.set_defaults(func=cmd_clip)
+
+    ck = sub.add_parser("click", help="绝对坐标点击（兜底）")
+    ck.add_argument("x", type=int, nargs="?")
+    ck.add_argument("y", type=int, nargs="?")
+    ck.add_argument("--ref", default=None, help="点元素中心")
+    ck.add_argument("--scale", type=float, default=None, help="ref 坐标 → 指针坐标的缩放")
+    ck.set_defaults(func=cmd_click)
+
+    mv = sub.add_parser("move", help="绝对坐标移动指针")
+    mv.add_argument("x", type=int)
+    mv.add_argument("y", type=int)
+    mv.set_defaults(func=cmd_move)
+
+    la = sub.add_parser("launch", help="启动程序/桌面文件")
+    la.add_argument("cmd", nargs="+")
+    la.add_argument("--wait", type=float, default=0)
+    la.add_argument("--app", default=None)
+    la.set_defaults(func=cmd_launch)
+
+    sh = sub.add_parser("shot", help="截图（默认整屏）")
+    sh.add_argument("out", nargs="?", default=None)
+    sh.add_argument("--json", action="store_true")
+    sh.set_defaults(func=cmd_shot)
+
+    args = p.parse_args()
+    try:
+        rc = args.func(args)
+    except KeyboardInterrupt:
+        rc = 130
+    sys.exit(rc or 0)
+
+if __name__ == "__main__":
+    main()

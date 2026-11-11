@@ -1,0 +1,62 @@
+{
+  "name": "dsh-desktop-ctl",
+  "version": "2.0.0",
+  "description": "DSH 桌面操控插件：Windows(UI Automation)/Linux(AT-SPI) 元素级操作 + 键鼠注入 + 截图，一个 desktop 工具搞定 GUI",
+  "license": "MIT",
+  "author": "lofter5",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cli",
+    "skill",
+    "docs",
+    "examples",
+    "cordis.patch.yml",
+    "install.sh",
+    "install.ps1",
+    "AGENTS-desktop-ctl.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "desktop",
+    "computer-use",
+    "ui-automation",
+    "at-spi",
+    "accessibility"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "headless"
+    },
+    "compatibility": {
+      "node": ">=20.18",
+      "profiles": [
+        "web",
+        "desktop"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "*",
+    "@deepseek-ai/schemastery": "*"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lofter5/dsh-desktop-ctl.git"
+  },
+  "bugs": {
+    "url": "https://github.com/lofter5/dsh-desktop-ctl/issues"
+  },
+  "homepage": "https://github.com/lofter5/dsh-desktop-ctl#readme"
+}

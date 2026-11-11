@@ -1,0 +1,17 @@
+# dsh-desktop-ctl 的 Cordis 组合补丁。
+#
+# 装上本包后（dsh plugin --profile <名字> add <包名|路径>），这份 patch 会被套用：
+# 往根组合里插入一个 desktop-ctl 组件，它注册 desktop 工具。
+#
+# config 说明：
+#   cliPath    覆盖 dctl 路径；留空 = 用包内 cli/<平台>/ 的默认后端
+#   powershell Windows 下用的 PowerShell（默认 powershell.exe，5.1 更稳）
+#   timeoutMs  单次调用超时
+#   promptSection  是否往系统提示词注入用法说明
+- insert:
+    - id: desktop-ctl
+      name: dsh-desktop-ctl
+      config:
+        cliPath: ''
+        timeoutMs: 120000
+        promptSection: true
